@@ -206,8 +206,8 @@ def ls_stat(path=".", serial=None):
                 " print((f," + IS_DIRECTORY("s[0]") + ",s[6]), \",\")",
                 "print(\"]\")"]
     out, err = execute(commands, serial)
-    print("\n".join(commands))
-    print(out, err)
+    #print("\n".join(commands))
+    #print(out, err)
     if err:
         raise IOError(clean_error(err))
     return ast.literal_eval(out.decode("utf-8"))

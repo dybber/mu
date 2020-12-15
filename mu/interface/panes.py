@@ -475,77 +475,80 @@ class MicroPythonREPLPane(QTextEdit):
         self.set_font_size(PANE_ZOOM_SIZES[size])
 
 
-class LocalFileSystem(QSortFilterProxyModel):
+class SortedFileSystem(QSortFilterProxyModel):
     """
     Sorted file system model, with ".." dir placed first, the "." dir
     not displayed then other directories and then files (similar to
     Total Commander)
-
     """
-    def __init__(self, home, parent=None):
+    def __init__(self, model, parent=None):
         super().__init__(parent)
-        self.home = home
         self.setSortCaseSensitivity(Qt.CaseInsensitive)
-        self._sourceModel = QFileSystemModel()
-        self._sourceModel.setFilter(QDir.AllDirs
-                                    | QDir.AllEntries
-                                    | QDir.NoDot)
-        self.setSourceModel(self._sourceModel)
+        self.setSourceModel(model)
+        self.sourceModel().dataChanged.connect(self.invalidate)
         self.sort(0)
-        self.setRootPath(home)
 
     def lessThan(self, left, right):
         """
         Sort file list with .. first, then directories, then files
         """
-        # Currently always sorting ascending
         # https://stackoverflow.com/questions/10789284/
-        fsm = self.sourceModel()
-        leftData = fsm.data(left)
-        rightData = fsm.data(right)
-        leftFileInfo = fsm.fileInfo(left)
-        rightFileInfo = fsm.fileInfo(right)
-
-        if leftData == "..":
+        source_model = self.sourceModel()
+        left_name = source_model.data(left, Qt.DisplayRole)
+        right_name = source_model.data(right, Qt.DisplayRole)
+        if left_name == "..":
             return True
-        if rightData == "..":
+        if right_name == "..":
             return False
 
-        if (not leftFileInfo.isDir() and rightFileInfo.isDir()):
+        left_is_dir = source_model.is_directory(left)
+        right_is_dir = source_model.is_directory(right)
+        if not left_is_dir and right_is_dir:
             return False
-        if (leftFileInfo.isDir() and not rightFileInfo.isDir()):
+        if left_is_dir and not right_is_dir:
             return True
 
         return super().lessThan(left, right)
 
-    def isDir(self, index):
+    def is_directory(self, index):
         """
         Is the given index refering to a directory?
         """
         ix = self.mapToSource(index)
-        return self._sourceModel.isDir(ix)
+        return self.sourceModel().is_directory(ix)
 
-    def getRootPathIndex(self):
+    def get_root_index(self):
         """
         What is the root index of this model?
         """
-        indexRoot = self._sourceModel.index(self._sourceModel.rootPath())
+        indexRoot = self.sourceModel().get_root_index()
         return self.mapFromSource(indexRoot)
 
-    def enterDirectory(self, index):
+    def enter_directory(self, index):
         """
         Move into the given directory
         """
         ix = self.mapToSource(index)
-        sourcePath = self._sourceModel.fileInfo(ix).absoluteFilePath()
-        indexRoot = self._sourceModel.index(sourcePath)
+        indexRoot = self.sourceModel().enter_directory(ix)
         return self.mapFromSource(indexRoot)
 
-    def setRootPath(self, path):
-        """
-        Change current root
-        """
-        self._sourceModel.setRootPath(path)
+
+class LocalFileSystem(QFileSystemModel):
+    def __init__(self, home, parent=None):
+        super().__init__(parent)
+        self.home = home
+        self.setRootPath(home)
+        self.setFilter(QDir.AllDirs | QDir.AllEntries | QDir.NoDot)
+
+    def is_directory(self, index):
+        return self.isDir(index)
+
+    def get_root_index(self):
+        return self.index(self.rootPath())
+
+    def enter_directory(self, index):
+        sourcePath = self.fileInfo(index).absoluteFilePath()
+        return self.index(sourcePath)
 
 
 class DeviceFileSystem(QAbstractListModel):
@@ -578,25 +581,24 @@ class DeviceFileSystem(QAbstractListModel):
     def columnCount(self, parent):
         return 1
 
-    def isDir(self, index):
+    def is_directory(self, index):
         """
         Is the given index refering to a directory?
         """
-        name, is_directory, size = self.content[index.row()]
-        return is_directory
+        name, is_dir, size = self.content[index.row()]
+        return is_dir
 
-    def enterDirectory(self, index):
+    def enter_directory(self, index):
         """
         Move into the given directory
         """
-        name, is_directory, size = self.content[index.row()]
+        name, is_dir, size = self.content[index.row()]
         if name == "..":
             self.path.pop()
-        elif is_directory:
+        elif is_dir:
             self.path.append(name)
 
         self.list_files.emit("/".join(self.path))
-
         return self.index(-1)
 
     def data(self, index, role):
@@ -610,7 +612,7 @@ class DeviceFileSystem(QAbstractListModel):
                 icon = self.iconProvider.icon(QFileIconProvider.File)
             return icon
 
-    def getRootPathIndex(self):
+    def get_root_index(self):
         return self.index(-1)
 
 # UI
@@ -625,17 +627,16 @@ class FileListView(QListView):
         self.installEventFilter(self)
         self.model = model
         self.setModel(self.model)
-        rootPathIndex = self.model.getRootPathIndex()
-        root = self.rootIndex()
-        self.setRootIndex(rootPathIndex)
+        root_index = self.model.get_root_index()
+        self.setRootIndex(root_index)
         self.doubleClicked.connect(self.enter_if_directory)
         self.returnPressed.connect(self.enter_if_directory)
         self.setAlternatingRowColors(True)
 
     def enter_if_directory(self, index):
-        if self.model.isDir(index):
-            newRootIndex = self.model.enterDirectory(index)
-            self.setRootIndex(newRootIndex)
+        if self.model.is_directory(index):
+            new_root = self.model.enter_directory(index)
+            self.setRootIndex(new_root)
 
     def eventFilter(self, watched, event):
         """
@@ -655,9 +656,11 @@ class FileListFrame(QFrame):
     def __init__(self, home, file_manager, parent=None):
         super().__init__(parent)
         self.home = home
-        self.local_model = LocalFileSystem(home, parent)
+        local_model = LocalFileSystem(home, parent)
+        self.local_model = SortedFileSystem(local_model)
         self.local_view = FileListView(self.local_model)
-        self.device_model = DeviceFileSystem(file_manager, parent)
+        device_model = DeviceFileSystem(file_manager, parent)
+        self.device_model = SortedFileSystem(device_model)
         self.device_view = FileListView(self.device_model)
 
         layout = QGridLayout()
