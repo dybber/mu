@@ -187,6 +187,31 @@ def ls(serial=None):
         raise IOError(clean_error(err))
     return ast.literal_eval(out.decode("utf-8"))
 
+def ls_stat(path=".", serial=None):
+    """
+    List the files on the micro:bit.
+
+    If no serial object is supplied, microfs will attempt to detect the
+    connection itself.
+
+    Returns a list of the files on the connected device or raises an IOError if
+    there's a problem.
+    """
+    IS_DIRECTORY = lambda file: file + "==0o040000"
+    commands = ["import os",
+                "foo = os.listdir(\"" + path + "\")",
+                "print(\"[\")",
+                "for f in foo:\n"
+                " s = os.stat(\"" + path + "/\" + f)\n"
+                " print((f," + IS_DIRECTORY("s[0]") + ",s[6]), \",\")",
+                "print(\"]\")"]
+    out, err = execute(commands, serial)
+    print("\n".join(commands))
+    print(out, err)
+    if err:
+        raise IOError(clean_error(err))
+    return ast.literal_eval(out.decode("utf-8"))
+
 
 def rm(filename, serial=None):
     """

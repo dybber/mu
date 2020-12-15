@@ -35,6 +35,11 @@ from PyQt5.QtCore import (
     pyqtSignal,
     QTimer,
     QUrl,
+    QDir,
+    QSortFilterProxyModel,
+    QModelIndex,
+    QEvent,
+    QAbstractListModel
 )
 from collections import deque
 from PyQt5.QtWidgets import (
@@ -47,6 +52,9 @@ from PyQt5.QtWidgets import (
     QMenu,
     QApplication,
     QTreeView,
+    QFileSystemModel,
+    QListView,
+    QFileIconProvider,
 )
 from PyQt5.QtGui import (
     QKeySequence,
@@ -465,6 +473,205 @@ class MicroPythonREPLPane(QTextEdit):
         Set the current zoom level given the "t-shirt" size.
         """
         self.set_font_size(PANE_ZOOM_SIZES[size])
+
+
+class LocalFileSystem(QSortFilterProxyModel):
+    """
+    Sorted file system model, with ".." dir placed first, the "." dir
+    not displayed then other directories and then files (similar to
+    Total Commander)
+
+    """
+    def __init__(self, home, parent=None):
+        super().__init__(parent)
+        self.home = home
+        self.setSortCaseSensitivity(Qt.CaseInsensitive)
+        self._sourceModel = QFileSystemModel()
+        self._sourceModel.setFilter(QDir.AllDirs
+                                    | QDir.AllEntries
+                                    | QDir.NoDot)
+        self.setSourceModel(self._sourceModel)
+        self.sort(0)
+        self.setRootPath(home)
+
+    def lessThan(self, left, right):
+        """
+        Sort file list with .. first, then directories, then files
+        """
+        # Currently always sorting ascending
+        # https://stackoverflow.com/questions/10789284/
+        fsm = self.sourceModel()
+        leftData = fsm.data(left)
+        rightData = fsm.data(right)
+        leftFileInfo = fsm.fileInfo(left)
+        rightFileInfo = fsm.fileInfo(right)
+
+        if leftData == "..":
+            return True
+        if rightData == "..":
+            return False
+
+        if (not leftFileInfo.isDir() and rightFileInfo.isDir()):
+            return False
+        if (leftFileInfo.isDir() and not rightFileInfo.isDir()):
+            return True
+
+        return super().lessThan(left, right)
+
+    def isDir(self, index):
+        """
+        Is the given index refering to a directory?
+        """
+        ix = self.mapToSource(index)
+        return self._sourceModel.isDir(ix)
+
+    def getRootPathIndex(self):
+        """
+        What is the root index of this model?
+        """
+        indexRoot = self._sourceModel.index(self._sourceModel.rootPath())
+        return self.mapFromSource(indexRoot)
+
+    def enterDirectory(self, index):
+        """
+        Move into the given directory
+        """
+        ix = self.mapToSource(index)
+        sourcePath = self._sourceModel.fileInfo(ix).absoluteFilePath()
+        indexRoot = self._sourceModel.index(sourcePath)
+        return self.mapFromSource(indexRoot)
+
+    def setRootPath(self, path):
+        """
+        Change current root
+        """
+        self._sourceModel.setRootPath(path)
+
+
+class DeviceFileSystem(QAbstractListModel):
+    list_files = pyqtSignal(str)
+
+    def __init__(self, file_manager, parent=None):
+        super().__init__(parent)
+        self.path = []
+        self.content = []
+        self.iconProvider = QFileIconProvider()
+
+        file_manager.on_list_files.connect(self.on_ls)
+        file_manager.on_list_fail.connect(self.on_ls_fail)
+        self.list_files.connect(file_manager.ls_stat)
+        self.list_files.emit("/".join(self.path))
+
+    def on_ls(self, files):
+        self.content = files
+        if len(self.path) > 0:
+            self.content.append(("..", True, 1))
+        self.dataChanged.emit(self.createIndex(0, 0),
+                              self.createIndex(0, len(self.content)))
+
+    def on_ls_fail(self):
+        pass
+
+    def rowCount(self, parent):
+        return len(self.content)
+
+    def columnCount(self, parent):
+        return 1
+
+    def isDir(self, index):
+        """
+        Is the given index refering to a directory?
+        """
+        name, is_directory, size = self.content[index.row()]
+        return is_directory
+
+    def enterDirectory(self, index):
+        """
+        Move into the given directory
+        """
+        name, is_directory, size = self.content[index.row()]
+        if name == "..":
+            self.path.pop()
+        elif is_directory:
+            self.path.append(name)
+
+        self.list_files.emit("/".join(self.path))
+
+        return self.index(-1)
+
+    def data(self, index, role):
+        name, is_directory, size = self.content[index.row()]
+        if role == Qt.DisplayRole or role == Qt.EditRole:
+            return name
+        elif role == Qt.DecorationRole:
+            if is_directory:
+                icon = self.iconProvider.icon(QFileIconProvider.Folder)
+            else:
+                icon = self.iconProvider.icon(QFileIconProvider.File)
+            return icon
+
+    def getRootPathIndex(self):
+        return self.index(-1)
+
+# UI
+class FileListView(QListView):
+    """
+    QListView extended with a signal for a 'return'-key pressed event.
+    """
+    returnPressed = pyqtSignal(QModelIndex)
+
+    def __init__(self, model, parent=None):
+        super().__init__(parent)
+        self.installEventFilter(self)
+        self.model = model
+        self.setModel(self.model)
+        rootPathIndex = self.model.getRootPathIndex()
+        root = self.rootIndex()
+        self.setRootIndex(rootPathIndex)
+        self.doubleClicked.connect(self.enter_if_directory)
+        self.returnPressed.connect(self.enter_if_directory)
+        self.setAlternatingRowColors(True)
+
+    def enter_if_directory(self, index):
+        if self.model.isDir(index):
+            newRootIndex = self.model.enterDirectory(index)
+            self.setRootIndex(newRootIndex)
+
+    def eventFilter(self, watched, event):
+        """
+        Setup event filter to detect return keypress
+        """
+        if (event.type() == QEvent.KeyPress and
+                event.matches(QKeySequence.InsertParagraphSeparator)):
+            index = self.currentIndex()
+            self.returnPressed.emit(index)
+        return False # TODO, why always return False?
+
+
+class FileListFrame(QFrame):
+    set_message = pyqtSignal(str)
+    set_warning = pyqtSignal(str)
+
+    def __init__(self, home, file_manager, parent=None):
+        super().__init__(parent)
+        self.home = home
+        self.local_model = LocalFileSystem(home, parent)
+        self.local_view = FileListView(self.local_model)
+        self.device_model = DeviceFileSystem(file_manager, parent)
+        self.device_view = FileListView(self.device_model)
+
+        layout = QGridLayout()
+        self.setLayout(layout)
+        microbit_label = QLabel()
+        microbit_label.setText(_("Files on your device:"))
+        local_label = QLabel()
+        local_label.setText(_("Files on your computer:"))
+        self.microbit_label = microbit_label
+        self.local_label = local_label
+        layout.addWidget(microbit_label, 0, 0)
+        layout.addWidget(local_label, 0, 1)
+        layout.addWidget(self.device_view, 1, 0)
+        layout.addWidget(self.local_view, 1, 1)
 
 
 class MuFileList(QListWidget):

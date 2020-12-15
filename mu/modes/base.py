@@ -636,7 +636,7 @@ class FileManager(QObject):
     """
 
     # Emitted when the tuple of files on the device is known.
-    on_list_files = pyqtSignal(tuple)
+    on_list_files = pyqtSignal(list)
     # Emitted when the file with referenced filename is got from the device.
     on_get_file = pyqtSignal(str)
     # Emitted when the file with referenced filename is put onto the device.
@@ -674,7 +674,6 @@ class FileManager(QObject):
                 timeout=self.settings.get("serial_timeout", 2),
                 parity="N",
             )
-            self.ls()
         except Exception as ex:
             logger.exception(ex)
             self.on_list_fail.emit()
@@ -686,6 +685,18 @@ class FileManager(QObject):
         """
         try:
             result = tuple(microfs.ls(self.serial))
+            self.on_list_files.emit(result)
+        except Exception as ex:
+            logger.exception(ex)
+            self.on_list_fail.emit()
+
+    def ls_stat(self, path="."):
+        """
+        List the files on the micro:bit. Emit the resulting tuple of filenames
+        or emit a failure signal.
+        """
+        try:
+            result = microfs.ls_stat(path, self.serial)
             self.on_list_files.emit(result)
         except Exception as ex:
             logger.exception(ex)
