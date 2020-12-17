@@ -644,6 +644,10 @@ class FileManager(QObject):
     # Emitted when the file with referenced filename is deleted from the
     # device.
     on_delete_file = pyqtSignal(str)
+    # Emitted when a was successfully moved from one location to another on
+    # the device
+    on_move_file = pyqtSignal(str, str)
+
     # Emitted when Mu is unable to list the files on the device.
     on_list_fail = pyqtSignal()
     # Emitted when the referenced file fails to be got from the device.
@@ -652,6 +656,8 @@ class FileManager(QObject):
     on_put_fail = pyqtSignal(str)
     # Emitted when the referenced file fails to be deleted from the device.
     on_delete_fail = pyqtSignal(str)
+    # Emitted when a file failed to be moved between two device locations
+    on_move_fail = pyqtSignal(str, str)
 
     def __init__(self, port):
         """
@@ -739,3 +745,14 @@ class FileManager(QObject):
         except Exception as ex:
             logger.error(ex)
             self.on_delete_fail.emit(device_filename)
+
+    def mv(self, filename, new_name):
+        """
+        Move (or rename) a file from one location to another
+        """
+        try:
+            microfs.mv(filename, new_name, serial=self.serial)
+            self.on_move_file.emit(filename, new_name)
+        except Exception as ex:
+            logger.error(ex)
+            self.on_move_fail.emit(filename, new_name)

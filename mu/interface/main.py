@@ -60,13 +60,15 @@ from mu.interface.panes import (
     JupyterREPLPane,
     MicroPythonREPLPane,
     FileSystemPane,
-    FileListFrame,
     PlotterPane,
 )
 from mu.interface.editor import EditorPane
 from mu.interface.widgets import DeviceSelector
 from mu.resources import load_icon, load_pixmap
-
+from mu.interface.models import (
+    LocalFileSystem,
+    DeviceFileSystem,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -501,7 +503,11 @@ class Window(QMainWindow):
         self.data_received.emit(data)
 
     def add_filesystem(self, home, file_manager, board_name="board"):
-        self.fs_pane = FileListFrame(home, file_manager)
+        local_file_system = LocalFileSystem(home, self)
+        device_file_system = DeviceFileSystem(file_manager, self)
+        self.fs_pane = FileSystemPane(
+            local_file_system, device_file_system, board_name
+        )
         self.fs = QDockWidget(_("Filesystem on ") + board_name)
         self.fs.setWidget(self.fs_pane)
         self.fs.setFeatures(QDockWidget.DockWidgetMovable)

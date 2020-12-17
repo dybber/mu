@@ -35,26 +35,20 @@ from PyQt5.QtCore import (
     pyqtSignal,
     QTimer,
     QUrl,
-    QDir,
-    QSortFilterProxyModel,
     QModelIndex,
     QEvent,
-    QAbstractListModel
 )
 from collections import deque
 from PyQt5.QtWidgets import (
     QMessageBox,
     QTextEdit,
     QFrame,
-    QListWidget,
     QGridLayout,
     QLabel,
     QMenu,
     QApplication,
     QTreeView,
-    QFileSystemModel,
     QListView,
-    QFileIconProvider,
 )
 from PyQt5.QtGui import (
     QKeySequence,
@@ -68,7 +62,9 @@ from qtconsole.rich_jupyter_widget import RichJupyterWidget
 from mu import language_code
 from mu.interface.themes import Font
 from mu.interface.themes import DEFAULT_FONT_SIZE
-
+from mu.interface.models import (
+    SortedFileSystem,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -475,198 +471,112 @@ class MicroPythonREPLPane(QTextEdit):
         self.set_font_size(PANE_ZOOM_SIZES[size])
 
 
-class SortedFileSystem(QSortFilterProxyModel):
-    """
-    Sorted file system model, with ".." dir placed first, the "." dir
-    not displayed then other directories and then files (similar to
-    Total Commander)
-    """
-    def __init__(self, model, parent=None):
-        super().__init__(parent)
-        self.setSortCaseSensitivity(Qt.CaseInsensitive)
-        self.setSourceModel(model)
-        self.sourceModel().dataChanged.connect(self.invalidate)
-        self.sort(0)
-
-    def lessThan(self, left, right):
-        """
-        Sort file list with .. first, then directories, then files
-        """
-        # https://stackoverflow.com/questions/10789284/
-        source_model = self.sourceModel()
-        left_name = source_model.data(left, Qt.DisplayRole)
-        right_name = source_model.data(right, Qt.DisplayRole)
-        if left_name == "..":
-            return True
-        if right_name == "..":
-            return False
-
-        left_is_dir = source_model.is_directory(left)
-        right_is_dir = source_model.is_directory(right)
-        if not left_is_dir and right_is_dir:
-            return False
-        if left_is_dir and not right_is_dir:
-            return True
-
-        return super().lessThan(left, right)
-
-    def is_directory(self, index):
-        """
-        Is the given index refering to a directory?
-        """
-        ix = self.mapToSource(index)
-        return self.sourceModel().is_directory(ix)
-
-    def get_root_index(self):
-        """
-        What is the root index of this model?
-        """
-        indexRoot = self.sourceModel().get_root_index()
-        return self.mapFromSource(indexRoot)
-
-    def enter_directory(self, index):
-        """
-        Move into the given directory
-        """
-        ix = self.mapToSource(index)
-        indexRoot = self.sourceModel().enter_directory(ix)
-        return self.mapFromSource(indexRoot)
-
-
-class LocalFileSystem(QFileSystemModel):
-    def __init__(self, home, parent=None):
-        super().__init__(parent)
-        self.home = home
-        self.setRootPath(home)
-        self.setFilter(QDir.AllDirs | QDir.AllEntries | QDir.NoDot)
-
-    def is_directory(self, index):
-        return self.isDir(index)
-
-    def get_root_index(self):
-        return self.index(self.rootPath())
-
-    def enter_directory(self, index):
-        sourcePath = self.fileInfo(index).absoluteFilePath()
-        return self.index(sourcePath)
-
-
-class DeviceFileSystem(QAbstractListModel):
-    list_files = pyqtSignal(str)
-
-    def __init__(self, file_manager, parent=None):
-        super().__init__(parent)
-        self.path = []
-        self.content = []
-        self.iconProvider = QFileIconProvider()
-
-        file_manager.on_list_files.connect(self.on_ls)
-        file_manager.on_list_fail.connect(self.on_ls_fail)
-        self.list_files.connect(file_manager.ls_stat)
-        self.list_files.emit("/".join(self.path))
-
-    def on_ls(self, files):
-        self.content = files
-        if len(self.path) > 0:
-            self.content.append(("..", True, 1))
-        self.dataChanged.emit(self.createIndex(0, 0),
-                              self.createIndex(0, len(self.content)))
-
-    def on_ls_fail(self):
-        pass
-
-    def rowCount(self, parent):
-        return len(self.content)
-
-    def columnCount(self, parent):
-        return 1
-
-    def is_directory(self, index):
-        """
-        Is the given index refering to a directory?
-        """
-        name, is_dir, size = self.content[index.row()]
-        return is_dir
-
-    def enter_directory(self, index):
-        """
-        Move into the given directory
-        """
-        name, is_dir, size = self.content[index.row()]
-        if name == "..":
-            self.path.pop()
-        elif is_dir:
-            self.path.append(name)
-
-        self.list_files.emit("/".join(self.path))
-        return self.index(-1)
-
-    def data(self, index, role):
-        name, is_directory, size = self.content[index.row()]
-        if role == Qt.DisplayRole or role == Qt.EditRole:
-            return name
-        elif role == Qt.DecorationRole:
-            if is_directory:
-                icon = self.iconProvider.icon(QFileIconProvider.Folder)
-            else:
-                icon = self.iconProvider.icon(QFileIconProvider.File)
-            return icon
-
-    def get_root_index(self):
-        return self.index(-1)
-
 # UI
-class FileListView(QListView):
+class MuFileList(QListView):
     """
     QListView extended with a signal for a 'return'-key pressed event.
     """
+
     returnPressed = pyqtSignal(QModelIndex)
+    delete = pyqtSignal(str)
 
     def __init__(self, model, parent=None):
         super().__init__(parent)
         self.installEventFilter(self)
-        self.model = model
-        self.setModel(self.model)
-        root_index = self.model.get_root_index()
+        self.setModel(model)
+        root_index = self.model().get_root_index()
         self.setRootIndex(root_index)
         self.doubleClicked.connect(self.enter_if_directory)
         self.returnPressed.connect(self.enter_if_directory)
+        self.delete.connect(self.do_delete)
         self.setAlternatingRowColors(True)
 
+        # Add a right-click menu
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.show_context_menu)
+
+        # Disable renaming on double click, we use double click for
+        # entering a directory, but instead rename when an already
+        # selected item is clicked
+        self.setEditTriggers(self.SelectedClicked)
+
+    def do_delete(self, filename):
+        print("Do delete")
+
     def enter_if_directory(self, index):
-        if self.model.is_directory(index):
-            new_root = self.model.enter_directory(index)
+        if self.model().is_directory(index):
+            new_root = self.model().enter_directory(index)
             self.setRootIndex(new_root)
 
     def eventFilter(self, watched, event):
         """
         Setup event filter to detect return keypress
         """
-        if (event.type() == QEvent.KeyPress and
-                event.matches(QKeySequence.InsertParagraphSeparator)):
+        if (
+            event.type() == QEvent.KeyPress
+            and event.matches(QKeySequence.InsertParagraphSeparator)
+            and not self.state() == self.EditingState
+        ):
             index = self.currentIndex()
             self.returnPressed.emit(index)
-        return False # TODO, why always return False?
+        return False  # TODO, why always return False?
+
+    def show_context_menu(self, point):
+        index = self.indexAt(point)
+        if index.isValid():
+            filename = self.model().data(index, Qt.DisplayRole)
+        else:
+            filename = None
+
+        menu = QMenu(self)
+        open_action = menu.addAction(_("Open"))
+        delete_action = menu.addAction(_("Delete (cannot be undone)"))
+        rename_action = menu.addAction(_("Rename"))
+
+        action = menu.exec_(self.mapToGlobal(point))
+        if action == delete_action:
+            self.setDisabled(True)
+            msg = _("Deleting '{}'.").format(filename)
+            logger.info(msg)
+            # self.set_message.emit(msg)
+            self.delete.emit(filename)
+        elif action == rename_action:
+            msg = _("Renaming '{}'.").format(filename)
+            logger.info(msg)
+            self.edit(index)
+            # self.set_message.emit(msg)
+            self.delete.emit(filename)
+        elif action == open_action:
+            # TODO: get full path
+            print("Opening:", filename)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(filename))
+
+    def on_delete_succeeded(self, filename):
+        """
+        Fired when the delete event is completed for the given filename.
+        """
+        msg = _("'{}' successfully deleted.").format(filename)
+        # self.set_message.emit(msg) # TODO, reenable
+        self.model().list_files.emit()
 
 
-class FileListFrame(QFrame):
+class FileSystemPane(QFrame):
     set_message = pyqtSignal(str)
     set_warning = pyqtSignal(str)
 
-    def __init__(self, home, file_manager, parent=None):
+    def __init__(
+        self, local_file_system, device_file_system, board_name, parent=None
+    ):
         super().__init__(parent)
-        self.home = home
-        local_model = LocalFileSystem(home, parent)
-        self.local_model = SortedFileSystem(local_model)
-        self.local_view = FileListView(self.local_model)
-        device_model = DeviceFileSystem(file_manager, parent)
-        self.device_model = SortedFileSystem(device_model)
-        self.device_view = FileListView(self.device_model)
+        self.local_model = SortedFileSystem(local_file_system)
+        self.local_view = MuFileList(self.local_model)
+        self.device_model = SortedFileSystem(device_file_system)
+        self.device_view = MuFileList(self.device_model)
 
         layout = QGridLayout()
         self.setLayout(layout)
         microbit_label = QLabel()
-        microbit_label.setText(_("Files on your device:"))
+        microbit_label.setText(_("Files on your {}:".format(board_name)))
         local_label = QLabel()
         local_label.setText(_("Files on your computer:"))
         self.microbit_label = microbit_label
@@ -677,340 +587,340 @@ class FileListFrame(QFrame):
         layout.addWidget(self.local_view, 1, 1)
 
 
-class MuFileList(QListWidget):
-    """
-    Contains shared methods for the two types of file listing used in Mu.
-    """
+# class MuFileList(QListWidget):
+#     """
+#     Contains shared methods for the two types of file listing used in Mu.
+#     """
 
-    disable = pyqtSignal()
-    list_files = pyqtSignal()
-    set_message = pyqtSignal(str)
+#     disable = pyqtSignal()
+#     list_files = pyqtSignal()
+#     set_message = pyqtSignal(str)
 
-    def show_confirm_overwrite_dialog(self):
-        """
-        Display a dialog to check if an existing file should be overwritten.
+#     def show_confirm_overwrite_dialog(self):
+#         """
+#         Display a dialog to check if an existing file should be overwritten.
 
-        Returns a boolean indication of the user's decision.
-        """
-        msg = QMessageBox(self)
-        msg.setIcon(QMessageBox.Information)
-        msg.setText(_("File already exists; overwrite it?"))
-        msg.setWindowTitle(_("File already exists"))
-        msg.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
-        return msg.exec_() == QMessageBox.Ok
-
-
-class MicroPythonDeviceFileList(MuFileList):
-    """
-    Represents a list of files on a MicroPython device.
-    """
-
-    put = pyqtSignal(str)
-    delete = pyqtSignal(str)
-
-    def __init__(self, home):
-        super().__init__()
-        self.home = home
-        self.setDragDropMode(QListWidget.DragDrop)
-
-    def dropEvent(self, event):
-        source = event.source()
-        if isinstance(source, LocalFileList):
-            file_exists = self.findItems(
-                source.currentItem().text(), Qt.MatchExactly
-            )
-            if (
-                not file_exists
-                or file_exists
-                and self.show_confirm_overwrite_dialog()
-            ):
-                self.disable.emit()
-                local_filename = os.path.join(
-                    self.home, source.currentItem().text()
-                )
-                msg = _("Copying '{}' to micro:bit.").format(local_filename)
-                logger.info(msg)
-                self.set_message.emit(msg)
-                self.put.emit(local_filename)
-
-    def on_put(self, microbit_file):
-        """
-        Fired when the put event is completed for the given filename.
-        """
-        msg = _("'{}' successfully copied to micro:bit.").format(microbit_file)
-        self.set_message.emit(msg)
-        self.list_files.emit()
-
-    def contextMenuEvent(self, event):
-        menu = QMenu(self)
-        delete_action = menu.addAction(_("Delete (cannot be undone)"))
-        action = menu.exec_(self.mapToGlobal(event.pos()))
-        if action == delete_action:
-            self.disable.emit()
-            microbit_filename = self.currentItem().text()
-            logger.info("Deleting {}".format(microbit_filename))
-            msg = _("Deleting '{}' from micro:bit.").format(microbit_filename)
-            logger.info(msg)
-            self.set_message.emit(msg)
-            self.delete.emit(microbit_filename)
-
-    def on_delete(self, microbit_file):
-        """
-        Fired when the delete event is completed for the given filename.
-        """
-        msg = _("'{}' successfully deleted from micro:bit.").format(
-            microbit_file
-        )
-        self.set_message.emit(msg)
-        self.list_files.emit()
+#         Returns a boolean indication of the user's decision.
+#         """
+#         msg = QMessageBox(self)
+#         msg.setIcon(QMessageBox.Information)
+#         msg.setText(_("File already exists; overwrite it?"))
+#         msg.setWindowTitle(_("File already exists"))
+#         msg.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+#         return msg.exec_() == QMessageBox.Ok
 
 
-class LocalFileList(MuFileList):
-    """
-    Represents a list of files in the Mu directory on the local machine.
-    """
+# class MicroPythonDeviceFileList(MuFileList):
+#     """
+#     Represents a list of files on a MicroPython device.
+#     """
 
-    get = pyqtSignal(str, str)
-    put = pyqtSignal(str, str)
-    open_file = pyqtSignal(str)
+#     put = pyqtSignal(str)
+#     delete = pyqtSignal(str)
 
-    def __init__(self, home):
-        super().__init__()
-        self.home = home
-        self.setDragDropMode(QListWidget.DragDrop)
+#     def __init__(self, home):
+#         super().__init__()
+#         self.home = home
+#         self.setDragDropMode(QListWidget.DragDrop)
 
-    def dropEvent(self, event):
-        source = event.source()
-        if isinstance(source, MicroPythonDeviceFileList):
-            file_exists = self.findItems(
-                source.currentItem().text(), Qt.MatchExactly
-            )
-            if (
-                not file_exists
-                or file_exists
-                and self.show_confirm_overwrite_dialog()
-            ):
-                self.disable.emit()
-                microbit_filename = source.currentItem().text()
-                local_filename = os.path.join(self.home, microbit_filename)
-                msg = _(
-                    "Getting '{}' from micro:bit. " "Copying to '{}'."
-                ).format(microbit_filename, local_filename)
-                logger.info(msg)
-                self.set_message.emit(msg)
-                self.get.emit(microbit_filename, local_filename)
+#     def dropEvent(self, event):
+#         source = event.source()
+#         if isinstance(source, LocalFileList):
+#             file_exists = self.findItems(
+#                 source.currentItem().text(), Qt.MatchExactly
+#             )
+#             if (
+#                 not file_exists
+#                 or file_exists
+#                 and self.show_confirm_overwrite_dialog()
+#             ):
+#                 self.disable.emit()
+#                 local_filename = os.path.join(
+#                     self.home, source.currentItem().text()
+#                 )
+#                 msg = _("Copying '{}' to micro:bit.").format(local_filename)
+#                 logger.info(msg)
+#                 self.set_message.emit(msg)
+#                 self.put.emit(local_filename)
 
-    def on_get(self, microbit_file):
-        """
-        Fired when the get event is completed for the given filename.
-        """
-        msg = _(
-            "Successfully copied '{}' " "from the micro:bit to your computer."
-        ).format(microbit_file)
-        self.set_message.emit(msg)
-        self.list_files.emit()
+#     def on_put(self, microbit_file):
+#         """
+#         Fired when the put event is completed for the given filename.
+#         """
+#         msg = _("'{}' successfully copied to micro:bit.").format(microbit_file)
+#         self.set_message.emit(msg)
+#         self.list_files.emit()
 
-    def contextMenuEvent(self, event):
-        menu = QMenu(self)
-        local_filename = self.currentItem().text()
-        # Get the file extension
-        ext = os.path.splitext(local_filename)[1].lower()
-        open_internal_action = None
-        # Mu micro:bit mode only handles .py & .hex
-        if ext == ".py" or ext == ".hex":
-            open_internal_action = menu.addAction(_("Open in Mu"))
-        if ext == ".py":
-            write_to_main_action = menu.addAction(
-                _("Write to main.py on device")
-            )
-        # Open outside Mu (things get meta if Mu is the default application)
-        open_action = menu.addAction(_("Open"))
-        action = menu.exec_(self.mapToGlobal(event.pos()))
-        if action == open_action:
-            # Get the file's path
-            path = os.path.abspath(os.path.join(self.home, local_filename))
-            logger.info("Opening {}".format(path))
-            msg = _("Opening '{}'").format(local_filename)
-            logger.info(msg)
-            self.set_message.emit(msg)
-            # Let Qt work out how to open it
-            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
-        elif action == open_internal_action:
-            logger.info("Open {} internally".format(local_filename))
-            # Get the file's path
-            path = os.path.join(self.home, local_filename)
-            # Send the signal bubbling up the tree
-            self.open_file.emit(path)
-        elif action == write_to_main_action:
-            path = os.path.join(self.home, local_filename)
-            self.put.emit(path, "main.py")
+#     def contextMenuEvent(self, event):
+#         menu = QMenu(self)
+#         delete_action = menu.addAction(_("Delete (cannot be undone)"))
+#         action = menu.exec_(self.mapToGlobal(event.pos()))
+#         if action == delete_action:
+#             self.disable.emit()
+#             microbit_filename = self.currentItem().text()
+#             logger.info("Deleting {}".format(microbit_filename))
+#             msg = _("Deleting '{}' from micro:bit.").format(microbit_filename)
+#             logger.info(msg)
+#             self.set_message.emit(msg)
+#             self.delete.emit(microbit_filename)
+
+#     def on_delete(self, microbit_file):
+#         """
+#         Fired when the delete event is completed for the given filename.
+#         """
+#         msg = _("'{}' successfully deleted from micro:bit.").format(
+#             microbit_file
+#         )
+#         self.set_message.emit(msg)
+#         self.list_files.emit()
 
 
-class FileSystemPane(QFrame):
-    """
-    Contains two QListWidgets representing the micro:bit and the user's code
-    directory. Users transfer files by dragging and dropping. Highlighted files
-    can be selected for deletion.
-    """
+# class LocalFileList(MuFileList):
+#     """
+#     Represents a list of files in the Mu directory on the local machine.
+#     """
 
-    set_message = pyqtSignal(str)
-    set_warning = pyqtSignal(str)
-    list_files = pyqtSignal()
-    open_file = pyqtSignal(str)
+#     get = pyqtSignal(str, str)
+#     put = pyqtSignal(str, str)
+#     open_file = pyqtSignal(str)
 
-    def __init__(self, home):
-        super().__init__()
-        self.home = home
-        self.font = Font().load()
-        microbit_fs = MicroPythonDeviceFileList(home)
-        local_fs = LocalFileList(home)
+#     def __init__(self, home):
+#         super().__init__()
+#         self.home = home
+#         self.setDragDropMode(QListWidget.DragDrop)
 
-        @local_fs.open_file.connect
-        def on_open_file(file):
-            # Bubble the signal up
-            self.open_file.emit(file)
+#     def dropEvent(self, event):
+#         source = event.source()
+#         if isinstance(source, MicroPythonDeviceFileList):
+#             file_exists = self.findItems(
+#                 source.currentItem().text(), Qt.MatchExactly
+#             )
+#             if (
+#                 not file_exists
+#                 or file_exists
+#                 and self.show_confirm_overwrite_dialog()
+#             ):
+#                 self.disable.emit()
+#                 microbit_filename = source.currentItem().text()
+#                 local_filename = os.path.join(self.home, microbit_filename)
+#                 msg = _(
+#                     "Getting '{}' from micro:bit. " "Copying to '{}'."
+#                 ).format(microbit_filename, local_filename)
+#                 logger.info(msg)
+#                 self.set_message.emit(msg)
+#                 self.get.emit(microbit_filename, local_filename)
 
-        layout = QGridLayout()
-        self.setLayout(layout)
-        microbit_label = QLabel()
-        microbit_label.setText(_("Files on your device:"))
-        local_label = QLabel()
-        local_label.setText(_("Files on your computer:"))
-        self.microbit_label = microbit_label
-        self.local_label = local_label
-        self.microbit_fs = microbit_fs
-        self.local_fs = local_fs
-        self.set_font_size()
-        layout.addWidget(microbit_label, 0, 0)
-        layout.addWidget(local_label, 0, 1)
-        layout.addWidget(microbit_fs, 1, 0)
-        layout.addWidget(local_fs, 1, 1)
-        self.microbit_fs.disable.connect(self.disable)
-        self.microbit_fs.set_message.connect(self.show_message)
-        self.local_fs.disable.connect(self.disable)
-        self.local_fs.set_message.connect(self.show_message)
+#     def on_get(self, microbit_file):
+#         """
+#         Fired when the get event is completed for the given filename.
+#         """
+#         msg = _(
+#             "Successfully copied '{}' " "from the micro:bit to your computer."
+#         ).format(microbit_file)
+#         self.set_message.emit(msg)
+#         self.list_files.emit()
 
-    def disable(self):
-        """
-        Stops interaction with the list widgets.
-        """
-        self.microbit_fs.setDisabled(True)
-        self.local_fs.setDisabled(True)
-        self.microbit_fs.setAcceptDrops(False)
-        self.local_fs.setAcceptDrops(False)
+#     def contextMenuEvent(self, event):
+#         menu = QMenu(self)
+#         local_filename = self.currentItem().text()
+#         # Get the file extension
+#         ext = os.path.splitext(local_filename)[1].lower()
+#         open_internal_action = None
+#         # Mu micro:bit mode only handles .py & .hex
+#         if ext == ".py" or ext == ".hex":
+#             open_internal_action = menu.addAction(_("Open in Mu"))
+#         if ext == ".py":
+#             write_to_main_action = menu.addAction(
+#                 _("Write to main.py on device")
+#             )
+#         # Open outside Mu (things get meta if Mu is the default application)
+#         open_action = menu.addAction(_("Open"))
+#         action = menu.exec_(self.mapToGlobal(event.pos()))
+#         if action == open_action:
+#             # Get the file's path
+#             path = os.path.abspath(os.path.join(self.home, local_filename))
+#             logger.info("Opening {}".format(path))
+#             msg = _("Opening '{}'").format(local_filename)
+#             logger.info(msg)
+#             self.set_message.emit(msg)
+#             # Let Qt work out how to open it
+#             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+#         elif action == open_internal_action:
+#             logger.info("Open {} internally".format(local_filename))
+#             # Get the file's path
+#             path = os.path.join(self.home, local_filename)
+#             # Send the signal bubbling up the tree
+#             self.open_file.emit(path)
+#         elif action == write_to_main_action:
+#             path = os.path.join(self.home, local_filename)
+#             self.put.emit(path, "main.py")
 
-    def enable(self):
-        """
-        Allows interaction with the list widgets.
-        """
-        self.microbit_fs.setDisabled(False)
-        self.local_fs.setDisabled(False)
-        self.microbit_fs.setAcceptDrops(True)
-        self.local_fs.setAcceptDrops(True)
 
-    def show_message(self, message):
-        """
-        Emits the set_message signal.
-        """
-        self.set_message.emit(message)
+# class FileSystemPane(QFrame):
+#     """
+#     Contains two QListWidgets representing the micro:bit and the user's code
+#     directory. Users transfer files by dragging and dropping. Highlighted files
+#     can be selected for deletion.
+#     """
 
-    def show_warning(self, message):
-        """
-        Emits the set_warning signal.
-        """
-        self.set_warning.emit(message)
+#     set_message = pyqtSignal(str)
+#     set_warning = pyqtSignal(str)
+#     list_files = pyqtSignal()
+#     open_file = pyqtSignal(str)
 
-    def on_ls(self, microbit_files):
-        """
-        Displays a list of the files on the micro:bit.
+#     def __init__(self, home):
+#         super().__init__()
+#         self.home = home
+#         self.font = Font().load()
+#         microbit_fs = MicroPythonDeviceFileList(home)
+#         local_fs = LocalFileList(home)
 
-        Since listing files is always the final event in any interaction
-        between Mu and the micro:bit, this enables the controls again for
-        further interactions to take place.
-        """
-        self.microbit_fs.clear()
-        self.local_fs.clear()
-        for f in microbit_files:
-            self.microbit_fs.addItem(f)
-        local_files = [
-            f
-            for f in os.listdir(self.home)
-            if os.path.isfile(os.path.join(self.home, f))
-        ]
-        local_files.sort()
-        for f in local_files:
-            self.local_fs.addItem(f)
-        self.enable()
+#         @local_fs.open_file.connect
+#         def on_open_file(file):
+#             # Bubble the signal up
+#             self.open_file.emit(file)
 
-    def on_ls_fail(self):
-        """
-        Fired when listing files fails.
-        """
-        self.show_warning(
-            _(
-                "There was a problem getting the list of files on "
-                "the device. Please check Mu's logs for "
-                "technical information. Alternatively, try "
-                "unplugging/plugging-in your device and/or "
-                "restarting Mu."
-            )
-        )
-        self.disable()
+#         layout = QGridLayout()
+#         self.setLayout(layout)
+#         microbit_label = QLabel()
+#         microbit_label.setText(_("Files on your device:"))
+#         local_label = QLabel()
+#         local_label.setText(_("Files on your computer:"))
+#         self.microbit_label = microbit_label
+#         self.local_label = local_label
+#         self.microbit_fs = microbit_fs
+#         self.local_fs = local_fs
+#         self.set_font_size()
+#         layout.addWidget(microbit_label, 0, 0)
+#         layout.addWidget(local_label, 0, 1)
+#         layout.addWidget(microbit_fs, 1, 0)
+#         layout.addWidget(local_fs, 1, 1)
+#         self.microbit_fs.disable.connect(self.disable)
+#         self.microbit_fs.set_message.connect(self.show_message)
+#         self.local_fs.disable.connect(self.disable)
+#         self.local_fs.set_message.connect(self.show_message)
 
-    def on_put_fail(self, filename):
-        """
-        Fired when the referenced file cannot be copied onto the device.
-        """
-        self.show_warning(
-            _(
-                "There was a problem copying the file '{}' onto "
-                "the device. Please check Mu's logs for "
-                "more information."
-            ).format(filename)
-        )
+#     def disable(self):
+#         """
+#         Stops interaction with the list widgets.
+#         """
+#         self.microbit_fs.setDisabled(True)
+#         self.local_fs.setDisabled(True)
+#         self.microbit_fs.setAcceptDrops(False)
+#         self.local_fs.setAcceptDrops(False)
 
-    def on_delete_fail(self, filename):
-        """
-        Fired when a deletion on the device for the given file failed.
-        """
-        self.show_warning(
-            _(
-                "There was a problem deleting '{}' from the "
-                "device. Please check Mu's logs for "
-                "more information."
-            ).format(filename)
-        )
+#     def enable(self):
+#         """
+#         Allows interaction with the list widgets.
+#         """
+#         self.microbit_fs.setDisabled(False)
+#         self.local_fs.setDisabled(False)
+#         self.microbit_fs.setAcceptDrops(True)
+#         self.local_fs.setAcceptDrops(True)
 
-    def on_get_fail(self, filename):
-        """
-        Fired when getting the referenced file on the device failed.
-        """
-        self.show_warning(
-            _(
-                "There was a problem getting '{}' from the "
-                "device. Please check Mu's logs for "
-                "more information."
-            ).format(filename)
-        )
+#     def show_message(self, message):
+#         """
+#         Emits the set_message signal.
+#         """
+#         self.set_message.emit(message)
 
-    def set_theme(self, theme):
-        pass
+#     def show_warning(self, message):
+#         """
+#         Emits the set_warning signal.
+#         """
+#         self.set_warning.emit(message)
 
-    def set_font_size(self, new_size=DEFAULT_FONT_SIZE):
-        """
-        Sets the font size for all the textual elements in this pane.
-        """
-        self.font.setPointSize(new_size)
-        self.microbit_label.setFont(self.font)
-        self.local_label.setFont(self.font)
-        self.microbit_fs.setFont(self.font)
-        self.local_fs.setFont(self.font)
+#     def on_ls(self, microbit_files):
+#         """
+#         Displays a list of the files on the micro:bit.
 
-    def set_zoom(self, size):
-        """
-        Set the current zoom level given the "t-shirt" size.
-        """
-        self.set_font_size(PANE_ZOOM_SIZES[size])
+#         Since listing files is always the final event in any interaction
+#         between Mu and the micro:bit, this enables the controls again for
+#         further interactions to take place.
+#         """
+#         self.microbit_fs.clear()
+#         self.local_fs.clear()
+#         for f in microbit_files:
+#             self.microbit_fs.addItem(f)
+#         local_files = [
+#             f
+#             for f in os.listdir(self.home)
+#             if os.path.isfile(os.path.join(self.home, f))
+#         ]
+#         local_files.sort()
+#         for f in local_files:
+#             self.local_fs.addItem(f)
+#         self.enable()
+
+#     def on_ls_fail(self):
+#         """
+#         Fired when listing files fails.
+#         """
+#         self.show_warning(
+#             _(
+#                 "There was a problem getting the list of files on "
+#                 "the device. Please check Mu's logs for "
+#                 "technical information. Alternatively, try "
+#                 "unplugging/plugging-in your device and/or "
+#                 "restarting Mu."
+#             )
+#         )
+#         self.disable()
+
+#     def on_put_fail(self, filename):
+#         """
+#         Fired when the referenced file cannot be copied onto the device.
+#         """
+#         self.show_warning(
+#             _(
+#                 "There was a problem copying the file '{}' onto "
+#                 "the device. Please check Mu's logs for "
+#                 "more information."
+#             ).format(filename)
+#         )
+
+#     def on_delete_fail(self, filename):
+#         """
+#         Fired when a deletion on the device for the given file failed.
+#         """
+#         self.show_warning(
+#             _(
+#                 "There was a problem deleting '{}' from the "
+#                 "device. Please check Mu's logs for "
+#                 "more information."
+#             ).format(filename)
+#         )
+
+#     def on_get_fail(self, filename):
+#         """
+#         Fired when getting the referenced file on the device failed.
+#         """
+#         self.show_warning(
+#             _(
+#                 "There was a problem getting '{}' from the "
+#                 "device. Please check Mu's logs for "
+#                 "more information."
+#             ).format(filename)
+#         )
+
+#     def set_theme(self, theme):
+#         pass
+
+#     def set_font_size(self, new_size=DEFAULT_FONT_SIZE):
+#         """
+#         Sets the font size for all the textual elements in this pane.
+#         """
+#         self.font.setPointSize(new_size)
+#         self.microbit_label.setFont(self.font)
+#         self.local_label.setFont(self.font)
+#         self.microbit_fs.setFont(self.font)
+#         self.local_fs.setFont(self.font)
+
+#     def set_zoom(self, size):
+#         """
+#         Set the current zoom level given the "t-shirt" size.
+#         """
+#         self.set_font_size(PANE_ZOOM_SIZES[size])
 
 
 class PythonProcessPane(QTextEdit):
