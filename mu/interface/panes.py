@@ -501,25 +501,13 @@ class MuFileList(QListView):
         self.setEditTriggers(self.SelectedClicked)
 
     def do_delete(self, filename):
-        print("Do delete")
+        self.model().delete.emit(filename)
 
     def enter_if_directory(self, index):
         if self.model().is_directory(index):
             new_root = self.model().enter_directory(index)
             self.setRootIndex(new_root)
 
-    def eventFilter(self, watched, event):
-        """
-        Setup event filter to detect return keypress
-        """
-        if (
-            event.type() == QEvent.KeyPress
-            and event.matches(QKeySequence.InsertParagraphSeparator)
-            and not self.state() == self.EditingState
-        ):
-            index = self.currentIndex()
-            self.returnPressed.emit(index)
-        return False  # TODO, why always return False?
 
     def show_context_menu(self, point):
         index = self.indexAt(point)
@@ -535,7 +523,6 @@ class MuFileList(QListView):
 
         action = menu.exec_(self.mapToGlobal(point))
         if action == delete_action:
-            self.setDisabled(True)
             msg = _("Deleting '{}'.").format(filename)
             logger.info(msg)
             # self.set_message.emit(msg)
@@ -557,8 +544,27 @@ class MuFileList(QListView):
         """
         msg = _("'{}' successfully deleted.").format(filename)
         # self.set_message.emit(msg) # TODO, reenable
-        self.model().list_files.emit()
 
+    def eventFilter(self, watched, event):
+        """Setup event filter to detect return keypress, except return presses
+        occuring while editing - we want those to be processed
+        uninterrupted.
+        """
+        if (
+            event.type() == QEvent.KeyPress
+            and event.matches(QKeySequence.InsertParagraphSeparator)
+            and not self.state() == self.EditingState
+        ):
+            index = self.currentIndex()
+            self.returnPressed.emit(index)
+
+            # return True means: accept the event, deny other event
+            # filters from processing the same event
+            return True
+
+        # return False means: reject the event, and allow other event
+        # filters to process the event
+        return False
 
 class FileSystemPane(QFrame):
     set_message = pyqtSignal(str)
