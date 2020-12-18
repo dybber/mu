@@ -19,6 +19,7 @@ class SortedFileSystem(QSortFilterProxyModel):
     """
 
     delete = pyqtSignal(str)
+    put = pyqtSignal(str)
 
     def __init__(self, model, parent=None):
         super().__init__(parent)
@@ -27,6 +28,7 @@ class SortedFileSystem(QSortFilterProxyModel):
         self.sourceModel().dataChanged.connect(self.invalidate)
         self.sort(0)
         self.delete.connect(self.sourceModel().do_delete)
+        self.put.connect(self.sourceModel().put)
 
     def lessThan(self, left, right):
         """
@@ -76,6 +78,7 @@ class SortedFileSystem(QSortFilterProxyModel):
 class LocalFileSystem(QFileSystemModel):
 
     delete = pyqtSignal(str)
+    put = pyqtSignal(str)
     
     def __init__(self, home, parent=None):
         super().__init__(parent)
@@ -113,6 +116,7 @@ class DeviceFileSystem(QAbstractListModel):
 
     list_files = pyqtSignal(str)
     delete = pyqtSignal(str)
+    put = pyqtSignal(str)
     rename = pyqtSignal(str, str)
 
     def __init__(self, file_manager, parent=None):
@@ -123,13 +127,16 @@ class DeviceFileSystem(QAbstractListModel):
 
         file_manager.on_list_files.connect(self.on_ls)
         file_manager.on_list_fail.connect(self.on_ls_fail)
-        file_manager.on_move_file.connect(self.on_mv)
-        file_manager.on_move_fail.connect(self.on_mv_fail)
-        file_manager.on_delete_file.connect(self.on_delete)
-        file_manager.on_delete_fail.connect(self.on_delete_fail)
+        file_manager.on_move_file.connect(self.invalidate)
+        file_manager.on_move_fail.connect(self.invalidate)
+        file_manager.on_delete_file.connect(self.invalidate)
+        file_manager.on_delete_fail.connect(self.invalidate)
+        file_manager.on_put_file.connect(self.invalidate)
+        file_manager.on_put_fail.connect(self.invalidate)
         self.list_files.connect(file_manager.ls_stat)
         self.delete.connect(file_manager.delete)
         self.rename.connect(file_manager.mv)
+        self.put.connect(file_manager.put)
         self.invalidate()
 
     def invalidate(self):
@@ -211,14 +218,19 @@ class DeviceFileSystem(QAbstractListModel):
     def flags(self, index):
         """
         Make sure items are editable, to allow renaming, except .. and .
+        Make sure folders and top-level can receive drop events
+        Make sure both files and folders can be dragged
         """
         default_flags = super().flags(index)
 
         name, is_directory, size = self.content[index.row()]
-        if name == ".." or name == ".":
-            return default_flags
+        if not index.isValid() or name == ".." or name == ".":
+            return default_flags | Qt.ItemIsDropEnabled
+        elif is_directory:
+            return default_flags | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled | Qt.ItemIsEditable
+        else:
+            return default_flags | Qt.ItemIsDragEnabled | Qt.ItemIsEditable
 
-        return default_flags | Qt.ItemIsEditable
 
     def setData(self, index, value, role):
         """
@@ -234,3 +246,9 @@ class DeviceFileSystem(QAbstractListModel):
             self.invalidate()
             return True
         return False
+
+    def supportedDropActions(self):
+        return super().supportedDropActions() | Qt.MoveAction
+
+    def canDropMimeData(self, mimedata, action, row, column, parent):
+        return mimedata.hasUrls()

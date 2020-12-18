@@ -27,6 +27,7 @@ import string
 import bisect
 import os.path
 import codecs
+import urllib.parse
 
 from PyQt5.QtCore import (
     Qt,
@@ -478,6 +479,7 @@ class MuFileList(QListView):
     """
 
     returnPressed = pyqtSignal(QModelIndex)
+    put = pyqtSignal(str)
     delete = pyqtSignal(str)
 
     def __init__(self, model, parent=None):
@@ -488,8 +490,12 @@ class MuFileList(QListView):
         self.setRootIndex(root_index)
         self.doubleClicked.connect(self.enter_if_directory)
         self.returnPressed.connect(self.enter_if_directory)
-        self.delete.connect(self.do_delete)
+        self.delete.connect(self.model().delete)
+        self.put.connect(self.model().put)
         self.setAlternatingRowColors(True)
+        self.setDragDropMode(self.DragDrop)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
 
         # Add a right-click menu
         self.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -500,14 +506,109 @@ class MuFileList(QListView):
         # selected item is clicked
         self.setEditTriggers(self.SelectedClicked)
 
-    def do_delete(self, filename):
-        self.model().delete.emit(filename)
+    def show_confirm_overwrite_dialog(self):
+        """
+        Display a dialog to check if an existing file should be overwritten.
 
+        Returns a boolean indication of the user's decision.
+        """
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Information)
+        msg.setText(_("File already exists; overwrite it?"))
+        msg.setWindowTitle(_("File already exists"))
+        msg.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+        return msg.exec_() == QMessageBox.Ok
+        
     def enter_if_directory(self, index):
         if self.model().is_directory(index):
             new_root = self.model().enter_directory(index)
             self.setRootIndex(new_root)
 
+    def on_delete_succeeded(self, filename):
+        """
+        Fired when the delete event is completed for the given filename.
+        """
+        msg = _("'{}' successfully deleted.").format(filename)
+        # self.set_message.emit(msg) # TODO, reenable
+        
+    def eventFilter(self, watched, event):
+        """Setup event filter to detect return keypress, except return presses
+        occuring while editing - we want those to be processed
+        uninterrupted.
+        """
+        if (
+            event.type() == QEvent.KeyPress
+            and event.matches(QKeySequence.InsertParagraphSeparator)
+            and not self.state() == self.EditingState
+        ):
+            index = self.currentIndex()
+            self.returnPressed.emit(index)
+
+            # return True means: accept the event, deny other event
+            # filters from processing the same event
+            return True
+
+        # return False means: reject the event, and allow other event
+        # filters to process the event
+        return False
+
+
+class DeviceFileList(MuFileList):
+
+    def show_context_menu(self, point):
+        index = self.indexAt(point)
+        if index.isValid():
+            filename = self.model().data(index, Qt.DisplayRole)
+        else:
+            filename = None
+
+        menu = QMenu(self)
+        delete_action = menu.addAction(_("Delete (cannot be undone)"))
+        rename_action = menu.addAction(_("Rename"))
+
+        action = menu.exec_(self.mapToGlobal(point))
+        if action == delete_action:
+            msg = _("Deleting '{}'.").format(filename)
+            logger.info(msg)
+            # self.set_message.emit(msg)
+            self.delete.emit(filename)
+        elif action == rename_action:
+            msg = _("Renaming '{}'.").format(filename)
+            logger.info(msg)
+            self.edit(index)
+            # self.set_message.emit(msg)
+            self.delete.emit(filename)
+
+    def dropEvent(self, event):
+        """
+        Accept drop events of files which are local file urls (either from
+        LocalFileList or from OS)
+        """
+        if event.mimeData().hasUrls():
+            url = event.mimeData().urls()[0]
+            if url.isLocalFile():
+                filename = url.fileName()
+                # does the file already exist on device?
+                hits = self.model().match(self.model().index(0, 0),
+                                          Qt.DisplayRole,
+                                          filename,
+                                          1, # 1 hit necessary
+                                          Qt.MatchExactly)
+                exists_on_device = len(hits) > 0
+                if (
+                        not exists_on_device
+                        or (exists_on_device
+                        and self.show_confirm_overwrite_dialog())
+                ):
+                    local_path = url.toLocalFile()
+                    #                self.disable.emit()
+                    msg = _("Copying '{}' to device.").format(local_path)
+                    logger.info(msg)
+                    #self.set_message.emit(msg)
+                    self.put.emit(local_path)
+
+    
+class LocalFileList(MuFileList):
 
     def show_context_menu(self, point):
         index = self.indexAt(point)
@@ -538,34 +639,30 @@ class MuFileList(QListView):
             print("Opening:", filename)
             QDesktopServices.openUrl(QUrl.fromLocalFile(filename))
 
-    def on_delete_succeeded(self, filename):
-        """
-        Fired when the delete event is completed for the given filename.
-        """
-        msg = _("'{}' successfully deleted.").format(filename)
-        # self.set_message.emit(msg) # TODO, reenable
+    def dropEvent(self, event):
+        print("drop on LocalFileList")
+        source = event.source()
+        print(source)
+        if isinstance(source, MicroPythonDeviceFileList):
+            file_exists = self.findItems(
+                source.currentItem().text(), Qt.MatchExactly
+            )
+            if (
+                not file_exists
+                or file_exists
+                and self.show_confirm_overwrite_dialog()
+            ):
+                self.disable.emit()
+                microbit_filename = source.currentItem().text()
+                local_filename = os.path.join(self.home, microbit_filename)
+                msg = _(
+                    "Getting '{}' from device. " "Copying to '{}'."
+                ).format(microbit_filename, local_filename)
+                logger.info(msg)
+                self.set_message.emit(msg)
+                self.get.emit(microbit_filename, local_filename)
 
-    def eventFilter(self, watched, event):
-        """Setup event filter to detect return keypress, except return presses
-        occuring while editing - we want those to be processed
-        uninterrupted.
-        """
-        if (
-            event.type() == QEvent.KeyPress
-            and event.matches(QKeySequence.InsertParagraphSeparator)
-            and not self.state() == self.EditingState
-        ):
-            index = self.currentIndex()
-            self.returnPressed.emit(index)
-
-            # return True means: accept the event, deny other event
-            # filters from processing the same event
-            return True
-
-        # return False means: reject the event, and allow other event
-        # filters to process the event
-        return False
-
+    
 class FileSystemPane(QFrame):
     set_message = pyqtSignal(str)
     set_warning = pyqtSignal(str)
@@ -575,9 +672,9 @@ class FileSystemPane(QFrame):
     ):
         super().__init__(parent)
         self.local_model = SortedFileSystem(local_file_system)
-        self.local_view = MuFileList(self.local_model)
+        self.local_view = LocalFileList(self.local_model)
         self.device_model = SortedFileSystem(device_file_system)
-        self.device_view = MuFileList(self.device_model)
+        self.device_view = DeviceFileList(self.device_model)
 
         layout = QGridLayout()
         self.setLayout(layout)
